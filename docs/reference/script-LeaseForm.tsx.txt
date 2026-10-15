@@ -1,0 +1,1302 @@
+import { useState, useEffect } from 'react';
+import { supabase } from '../lib/supabase';
+import { Lease, Branch, FixedAssetType } from '../types/lease';
+import { calculateLeaseMetrics, generateAmortizationSchedule, PaymentTranche } from '../utils/leaseCalculations';
+import { determineLeaseClassification } from '../utils/leaseClassification';
+import { generateInitialRecognitionTransactions, saveTransactions } from '../utils/transactionGenerator';
+import { X, Calculator, CheckCircle2, HelpCircle, Plus, Trash2, AlertTriangle } from 'lucide-react';
+import { parseLocalDate } from '../utils/formatting';
+
+interface LeaseFormProps {
+  onClose: () => void;
+  onSuccess: () => void;
+  lease?: Lease;
+  userId: string;
+  selectedCompanyId?: string | null;
+}
+
+interface PaymentTrancheRow {
+  id: string;
+  fromMonth: number;
+  toMonth: number;
+  paymentAmount: string;
+}
+
+export function LeaseForm({ onClose, onSuccess, lease, userId, selectedCompanyId }: LeaseFormProps) {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [showClassificationWizard, setShowClassificationWizard] = useState(false);
+  const [branches, setBranches] = useState<Branch[]>([]);
+  const [showNewBranchForm, setShowNewBranchForm] = useState(false);
+  const [newBranchName, setNewBranchName] = useState('');
+  const [newBranchCode, setNewBranchCode] = useState('');
+
+  const [fixedAssetTypes, setFixedAssetTypes] = useState<FixedAssetType[]>([]);
+  const [showNewAssetTypeForm, setShowNewAssetTypeForm] = useState(false);
+  const [newAssetTypeName, setNewAssetTypeName] = useState('');
+  const [newAssetTypeCode, setNewAssetTypeCode] = useState('');
+
+  const [useVariablePayments, setUseVariablePayments] = useState(false);
+  const [paymentTranches, setPaymentTranches] = useState<PaymentTrancheRow[]>([
+    { id: crypto.randomUUID(), fromMonth: 1, toMonth: 12, paymentAmount: '' },
+  ]);
+
+  const [formData, setFormData] = useState({
+    branch_id: lease?.branch_id || '',
+    fixed_asset_type_id: lease?.fixed_asset_type_id || '',
+    lease_name: lease?.lease_name || '',
+    lease_description: lease?.lease_description || '',
+    lessor_name: lease?.lessor_name || '',
+    lessor_type: lease?.lessor_type || 'corporate',
+    lease_start_date: lease?.lease_start_date || '',
+    lease_end_date: lease?.lease_end_date || '',
+    payment_amount: lease?.payment_amount?.toString() || '',
+    payment_frequency: lease?.payment_frequency || 'monthly',
+    payment_timing: lease?.payment_timing || 'beginning',
+    incremental_borrowing_rate: lease?.incremental_borrowing_rate?.toString() || '',
+    initial_direct_costs: lease?.initial_direct_costs?.toString() || '0',
+    lease_incentives: lease?.lease_incentives?.toString() || '0',
+    residual_value_guarantee: lease?.residual_value_guarantee?.toString() || '0',
+    lease_classification: lease?.lease_classification || 'operating',
+    transfer_ownership: lease?.transfer_ownership || false,
+    purchase_option: lease?.purchase_option || false,
+    purchase_option_price: lease?.purchase_option_price?.toString() || '0',
+    asset_fair_value: lease?.asset_fair_value?.toString() || '0',
+    asset_market_value: lease?.asset_market_value?.toString() || '0',
+    asset_economic_life_years: lease?.asset_economic_life_years?.toString() || '0',
+    specialized_asset: lease?.specialized_asset || false,
+    auto_classified: lease?.auto_classified || false,
+  });
+
+  const [classificationResult, setClassificationResult] = useState<{
+    classification: 'operating' | 'finance';
+    reasons: string[];
+  } | null>(null);
+
+  useEffect(() => {
+    loadBranches();
+    loadFixedAssetTypes();
+    if (lease) {
+      loadExistingPaymentSchedule(lease.id);
+    }
+  }, []);
+
+  useEffect(() => {
+    const leaseTermMonths = calculateTermMonths();
+    const assetFairValue = parseFloat(formData.asset_fair_value) || 0;
+    const assetMarketValue = parseFloat(formData.asset_market_value) || 0;
+    const assetEconomicLifeYears = parseFloat(formData.asset_economic_life_years) || 0;
+    const purchaseOptionPrice = parseFloat(formData.purchase_option_price) || 0;
+
+    const fvRatioMet = assetMarketValue > 0 && assetFairValue > 0
+      ? (assetFairValue / assetMarketValue) >= 0.9
+      : false;
+
+    const econLifeMet = leaseTermMonths > 0 && assetEconomicLifeYears > 0
+      ? (leaseTermMonths / (assetEconomicLifeYears * 12)) >= 0.75
+      : false;
+
+    const bargainPurchaseMet = formData.purchase_option && purchaseOptionPrice > 0 && assetFairValue > 0
+      ? (purchaseOptionPrice / assetFairValue) < 0.9
+      : false;
+
+    const isFinance =
+      formData.transfer_ownership ||
+      bargainPurchaseMet ||
+      econLifeMet ||
+      fvRatioMet ||
+      formData.specialized_asset;
+
+    setFormData(prev => ({
+      ...prev,
+      lease_classification: isFinance ? 'finance' : 'operating',
+      auto_classified: true,
+    }));
+  }, [
+    formData.transfer_ownership,
+    formData.purchase_option,
+    formData.purchase_option_price,
+    formData.asset_fair_value,
+    formData.asset_market_value,
+    formData.asset_economic_life_years,
+    formData.specialized_asset,
+    formData.lease_start_date,
+    formData.lease_end_date,
+  ]);
+
+  const loadBranches = async () => {
+    try {
+      const { data, error } = await supabase
+        .from('branches')
+        .select('*')
+        .eq('is_active', true)
+        .order('branch_name');
+      if (error) throw error;
+      if (data) setBranches(data);
+    } catch (err: any) {
+      console.error('Error loading branches:', err.message);
+    }
+  };
+
+  const loadExistingPaymentSchedule = async (leaseId: string) => {
+    const { data } = await supabase
+      .from('lease_payment_schedules')
+      .select('*')
+      .eq('lease_id', leaseId)
+      .order('from_month');
+
+    if (data && data.length > 0) {
+      setUseVariablePayments(true);
+      setPaymentTranches(
+        data.map(row => ({
+          id: crypto.randomUUID(),
+          fromMonth: row.from_month,
+          toMonth: row.to_month,
+          paymentAmount: row.payment_amount.toString(),
+        }))
+      );
+    }
+  };
+
+  const loadFixedAssetTypes = async () => {
+    try {
+      const { data, error } = await supabase
+        .from('fixed_asset_types')
+        .select('*')
+        .eq('is_active', true)
+        .order('type_name');
+      if (error) throw error;
+      if (data) setFixedAssetTypes(data);
+    } catch (err: any) {
+      console.error('Error loading fixed asset types:', err.message);
+    }
+  };
+
+  const handleCreateFixedAssetType = async () => {
+    if (!newAssetTypeName.trim()) {
+      setError('Fixed asset type name is required');
+      return;
+    }
+    try {
+      const { data, error } = await supabase
+        .from('fixed_asset_types')
+        .insert([{
+          user_id: userId,
+          type_name: newAssetTypeName.trim(),
+          type_code: newAssetTypeCode.trim(),
+          description: '',
+          is_active: true,
+        }])
+        .select()
+        .single();
+      if (error) throw error;
+      setFixedAssetTypes([...fixedAssetTypes, data]);
+      setFormData({ ...formData, fixed_asset_type_id: data.id });
+      setShowNewAssetTypeForm(false);
+      setNewAssetTypeName('');
+      setNewAssetTypeCode('');
+      setError('');
+    } catch (err: any) {
+      setError(err.message);
+    }
+  };
+
+  const handleCreateBranch = async () => {
+    if (!newBranchName.trim()) {
+      setError('Branch name is required');
+      return;
+    }
+    try {
+      const { data, error } = await supabase
+        .from('branches')
+        .insert([{ user_id: userId, branch_name: newBranchName, branch_code: newBranchCode }])
+        .select()
+        .single();
+      if (error) throw error;
+      setBranches([...branches, data]);
+      setFormData({ ...formData, branch_id: data.id });
+      setShowNewBranchForm(false);
+      setNewBranchName('');
+      setNewBranchCode('');
+      setError('');
+    } catch (err: any) {
+      setError(err.message);
+    }
+  };
+
+  const calculateTermMonths = () => {
+    if (!formData.lease_start_date || !formData.lease_end_date) return 0;
+    const start = parseLocalDate(formData.lease_start_date);
+    const end = parseLocalDate(formData.lease_end_date);
+    return (end.getFullYear() - start.getFullYear()) * 12 + (end.getMonth() - start.getMonth());
+  };
+
+  const getEffectivePaymentSchedule = (): PaymentTranche[] | undefined => {
+    if (!useVariablePayments) return undefined;
+    return paymentTranches
+      .filter(t => t.paymentAmount !== '')
+      .map(t => ({
+        fromMonth: t.fromMonth,
+        toMonth: t.toMonth,
+        paymentAmount: parseFloat(t.paymentAmount) || 0,
+      }));
+  };
+
+  const getBasePaymentAmount = (): number => {
+    if (useVariablePayments && paymentTranches.length > 0) {
+      return parseFloat(paymentTranches[0].paymentAmount) || 0;
+    }
+    return parseFloat(formData.payment_amount) || 0;
+  };
+
+  const calculateAssetFairValue = () => {
+    const leaseTermMonths = calculateTermMonths();
+    if (leaseTermMonths <= 0) return 0;
+    const paymentAmount = getBasePaymentAmount();
+    const rate = parseFloat(formData.incremental_borrowing_rate) || 0;
+    const residual = parseFloat(formData.residual_value_guarantee) || 0;
+    if (paymentAmount === 0) return 0;
+    if (rate > 0) {
+      const monthlyRate = (rate / 100) / 12;
+      let pvPayments;
+      if (formData.payment_timing === 'beginning') {
+        pvPayments = paymentAmount * ((1 - Math.pow(1 + monthlyRate, -leaseTermMonths)) / monthlyRate) * (1 + monthlyRate);
+      } else {
+        pvPayments = paymentAmount * ((1 - Math.pow(1 + monthlyRate, -leaseTermMonths)) / monthlyRate);
+      }
+      const pvResidual = residual > 0 ? residual / Math.pow(1 + monthlyRate, leaseTermMonths) : 0;
+      return pvPayments + pvResidual;
+    }
+    return paymentAmount * leaseTermMonths;
+  };
+
+  const runClassificationWizard = () => {
+    const leaseTermMonths = calculateTermMonths();
+    if (leaseTermMonths <= 0) {
+      setError('Please set valid lease start and end dates first');
+      return;
+    }
+    const paymentAmount = getBasePaymentAmount();
+    if (!paymentAmount || !formData.incremental_borrowing_rate) {
+      setError('Please enter payment amount and borrowing rate first');
+      return;
+    }
+
+    const assetFairValue = parseFloat(formData.asset_fair_value) || 0;
+
+    const metrics = calculateLeaseMetrics({
+      leaseTermMonths,
+      paymentAmount,
+      incrementalBorrowingRate: parseFloat(formData.incremental_borrowing_rate),
+      initialDirectCosts: parseFloat(formData.initial_direct_costs),
+      leaseIncentives: parseFloat(formData.lease_incentives),
+      leaseStartDate: parseLocalDate(formData.lease_start_date),
+      paymentTiming: formData.payment_timing as 'beginning' | 'end',
+      residualValueGuarantee: parseFloat(formData.residual_value_guarantee),
+      paymentSchedule: getEffectivePaymentSchedule(),
+    });
+
+    const result = determineLeaseClassification({
+      leaseTermMonths,
+      assetEconomicLifeYears: parseFloat(formData.asset_economic_life_years) || 0,
+      presentValue: metrics.leaseLiability,
+      assetFairValue,
+      transferOwnership: formData.transfer_ownership,
+      purchaseOption: formData.purchase_option,
+      purchaseOptionPrice: parseFloat(formData.purchase_option_price) || 0,
+      specializedAsset: formData.specialized_asset,
+    });
+
+    setClassificationResult(result);
+    setFormData(prev => ({ ...prev, lease_classification: result.classification, auto_classified: true }));
+    setShowClassificationWizard(false);
+  };
+
+  const addTranche = () => {
+    const leaseTermMonths = calculateTermMonths();
+    const last = paymentTranches[paymentTranches.length - 1];
+    const nextFrom = last ? last.toMonth + 1 : 1;
+    const nextTo = leaseTermMonths > 0 ? Math.min(nextFrom + 11, leaseTermMonths) : nextFrom + 11;
+    setPaymentTranches([
+      ...paymentTranches,
+      { id: crypto.randomUUID(), fromMonth: nextFrom, toMonth: nextTo, paymentAmount: '' },
+    ]);
+  };
+
+  const removeTranche = (id: string) => {
+    setPaymentTranches(paymentTranches.filter(t => t.id !== id));
+  };
+
+  const updateTranche = (id: string, field: keyof PaymentTrancheRow, value: string | number) => {
+    setPaymentTranches(paymentTranches.map(t =>
+      t.id === id ? { ...t, [field]: value } : t
+    ));
+  };
+
+  const validateTranches = (termMonths: number): string | null => {
+    if (!useVariablePayments) return null;
+    if (paymentTranches.length === 0) return 'Add at least one payment period.';
+    for (const t of paymentTranches) {
+      if (!t.paymentAmount || parseFloat(t.paymentAmount) < 0) return 'All payment periods must have a valid amount.';
+      if (t.fromMonth < 1) return 'From Month must be at least 1.';
+      if (t.toMonth < t.fromMonth) return 'To Month must be >= From Month.';
+      if (termMonths > 0 && t.toMonth > termMonths) return `To Month cannot exceed lease term (${termMonths} months).`;
+    }
+    const sorted = [...paymentTranches].sort((a, b) => a.fromMonth - b.fromMonth);
+    for (let i = 1; i < sorted.length; i++) {
+      if (sorted[i].fromMonth <= sorted[i - 1].toMonth) {
+        return 'Payment periods must not overlap.';
+      }
+    }
+    return null;
+  };
+
+  const getScheduleCoverage = (): { covered: number; total: number } => {
+    const total = calculateTermMonths();
+    if (total <= 0 || !useVariablePayments) return { covered: 0, total };
+    let covered = 0;
+    for (const t of paymentTranches) {
+      const from = Math.max(1, t.fromMonth);
+      const to = Math.min(total, t.toMonth);
+      if (to >= from) covered += to - from + 1;
+    }
+    return { covered, total };
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoading(true);
+    setError('');
+
+    try {
+      const leaseTermMonths = calculateTermMonths();
+      if (leaseTermMonths <= 0) throw new Error('End date must be after start date');
+
+      const normalizedName = formData.lease_name.trim().toLowerCase();
+      if (!normalizedName) throw new Error('Lease name is required');
+
+      const duplicateQuery = supabase
+        .from('leases')
+        .select('id, lease_name')
+        .ilike('lease_name', formData.lease_name.trim());
+      const { data: duplicates, error: dupError } = await duplicateQuery;
+      if (dupError) throw dupError;
+      const conflict = (duplicates || []).find(
+        d => d.lease_name.trim().toLowerCase() === normalizedName && d.id !== lease?.id
+      );
+      if (conflict) {
+        throw new Error(`A lease named "${formData.lease_name.trim()}" already exists. Lease names must be unique.`);
+      }
+
+      if (useVariablePayments) {
+        const validationError = validateTranches(leaseTermMonths);
+        if (validationError) throw new Error(validationError);
+      }
+
+      const paymentAmount = useVariablePayments ? getBasePaymentAmount() : parseFloat(formData.payment_amount);
+      const paymentSchedule = getEffectivePaymentSchedule();
+
+      const metrics = calculateLeaseMetrics({
+        leaseTermMonths,
+        paymentAmount,
+        incrementalBorrowingRate: parseFloat(formData.incremental_borrowing_rate),
+        initialDirectCosts: parseFloat(formData.initial_direct_costs),
+        leaseIncentives: parseFloat(formData.lease_incentives),
+        leaseStartDate: parseLocalDate(formData.lease_start_date),
+        paymentTiming: formData.payment_timing as 'beginning' | 'end',
+        residualValueGuarantee: parseFloat(formData.residual_value_guarantee),
+        paymentSchedule,
+      });
+
+      const leaseData = {
+        user_id: userId,
+        company_id: selectedCompanyId || null,
+        branch_id: formData.branch_id || null,
+        fixed_asset_type_id: formData.fixed_asset_type_id || null,
+        lease_name: formData.lease_name,
+        lease_description: formData.lease_description,
+        lessor_name: formData.lessor_name,
+        lessor_type: formData.lessor_type,
+        lease_start_date: formData.lease_start_date,
+        lease_end_date: formData.lease_end_date,
+        lease_term_months: leaseTermMonths,
+        payment_amount: paymentAmount,
+        payment_frequency: formData.payment_frequency,
+        payment_timing: formData.payment_timing,
+        incremental_borrowing_rate: parseFloat(formData.incremental_borrowing_rate),
+        lease_classification: formData.lease_classification,
+        initial_direct_costs: parseFloat(formData.initial_direct_costs),
+        lease_incentives: parseFloat(formData.lease_incentives),
+        residual_value_guarantee: parseFloat(formData.residual_value_guarantee),
+        transfer_ownership: formData.transfer_ownership,
+        purchase_option: formData.purchase_option,
+        purchase_option_price: parseFloat(formData.purchase_option_price),
+        asset_fair_value: parseFloat(formData.asset_fair_value),
+        asset_market_value: parseFloat(formData.asset_market_value),
+        asset_economic_life_years: parseFloat(formData.asset_economic_life_years),
+        specialized_asset: formData.specialized_asset,
+        auto_classified: formData.auto_classified,
+        rou_asset: metrics.rouAsset,
+        lease_liability: metrics.leaseLiability,
+        status: 'active',
+        updated_at: new Date().toISOString(),
+      };
+
+      let leaseId: string;
+
+      if (lease) {
+        const { error: updateError } = await supabase.from('leases').update(leaseData).eq('id', lease.id);
+        if (updateError) {
+          if ((updateError as any).code === '23505') {
+            throw new Error(`A lease named "${formData.lease_name.trim()}" already exists. Lease names must be unique.`);
+          }
+          throw updateError;
+        }
+        leaseId = lease.id;
+        await supabase.from('amortization_schedules').delete().eq('lease_id', leaseId);
+        await supabase.from('lease_payment_schedules').delete().eq('lease_id', leaseId);
+        await supabase.from('lease_transactions').delete().eq('lease_id', leaseId);
+        await supabase.from('transactions').delete().eq('lease_id', leaseId);
+        await supabase.from('journal_entries').delete().eq('lease_id', leaseId);
+      } else {
+        const { data: newLease, error: insertError } = await supabase
+          .from('leases').insert([leaseData]).select().single();
+        if (insertError) {
+          if ((insertError as any).code === '23505') {
+            throw new Error(`A lease named "${formData.lease_name.trim()}" already exists. Lease names must be unique.`);
+          }
+          throw insertError;
+        }
+        leaseId = newLease.id;
+      }
+
+      if (useVariablePayments && paymentSchedule && paymentSchedule.length > 0) {
+        const scheduleRows = paymentSchedule.map(t => ({
+          lease_id: leaseId,
+          from_month: t.fromMonth,
+          to_month: t.toMonth,
+          payment_amount: t.paymentAmount,
+        }));
+        const { error: schedErr } = await supabase.from('lease_payment_schedules').insert(scheduleRows);
+        if (schedErr) throw schedErr;
+      }
+
+      const schedule = generateAmortizationSchedule({
+        leaseTermMonths,
+        paymentAmount,
+        incrementalBorrowingRate: parseFloat(formData.incremental_borrowing_rate),
+        initialDirectCosts: parseFloat(formData.initial_direct_costs),
+        leaseIncentives: parseFloat(formData.lease_incentives),
+        leaseStartDate: parseLocalDate(formData.lease_start_date),
+        paymentTiming: formData.payment_timing as 'beginning' | 'end',
+        residualValueGuarantee: parseFloat(formData.residual_value_guarantee),
+        paymentSchedule,
+      });
+
+      const scheduleData = schedule.map((row) => ({
+        lease_id: leaseId,
+        period_number: row.periodNumber,
+        period_date: `${row.periodDate.getFullYear()}-${String(row.periodDate.getMonth() + 1).padStart(2, '0')}-${String(row.periodDate.getDate()).padStart(2, '0')}`,
+        beginning_liability: row.beginningLiability,
+        payment_amount: row.paymentAmount,
+        interest_expense: row.interestExpense,
+        principal_reduction: row.principalReduction,
+        ending_liability: row.endingLiability,
+        rou_asset_balance: row.rouAssetBalance,
+        depreciation_expense: row.depreciationExpense,
+      }));
+
+      const { error: scheduleError } = await supabase.from('amortization_schedules').insert(scheduleData);
+      if (scheduleError) throw scheduleError;
+
+      const completeLeaseData: Lease = {
+        ...leaseData,
+        id: leaseId,
+        created_at: lease?.created_at || new Date().toISOString(),
+      } as Lease;
+      const initialTxns = await generateInitialRecognitionTransactions(completeLeaseData, userId);
+      await saveTransactions(initialTxns);
+
+      onSuccess();
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const termMonths = calculateTermMonths();
+  const coverage = getScheduleCoverage();
+  const isFullyCovered = useVariablePayments && coverage.total > 0 && coverage.covered >= coverage.total;
+  const hasGaps = useVariablePayments && coverage.total > 0 && coverage.covered < coverage.total;
+
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+      <div className="bg-white rounded-xl shadow-2xl max-w-4xl w-full max-h-[90vh] overflow-y-auto">
+        <div className="sticky top-0 bg-white border-b border-slate-200 px-6 py-4 flex items-center justify-between z-10">
+          <div className="flex items-center gap-3">
+            <div className="bg-blue-100 p-2 rounded-lg">
+              <Calculator className="w-5 h-5 text-blue-600" />
+            </div>
+            <h2 className="text-2xl font-bold text-slate-900">
+              {lease ? 'Edit Lease' : 'New Lease'}
+            </h2>
+          </div>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-600 transition">
+            <X className="w-6 h-6" />
+          </button>
+        </div>
+
+        <form onSubmit={handleSubmit} className="p-6">
+          {error && (
+            <div className="mb-6 bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg text-sm">
+              {error}
+            </div>
+          )}
+
+          {classificationResult && (
+            <div className="mb-6 bg-blue-50 border border-blue-200 rounded-lg p-4">
+              <div className="flex items-start gap-3">
+                <CheckCircle2 className="w-5 h-5 text-blue-600 mt-0.5" />
+                <div className="flex-1">
+                  <h3 className="font-semibold text-blue-900 mb-2">
+                    Classification Result: {classificationResult.classification === 'finance' ? 'Finance Lease' : 'Operating Lease'}
+                  </h3>
+                  <ul className="space-y-1 text-sm text-blue-800">
+                    {classificationResult.reasons.map((reason, idx) => (
+                      <li key={idx}>• {reason}</li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <div className="space-y-6">
+            <div>
+              <h3 className="text-lg font-bold text-slate-900 mb-4">Basic Information</h3>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="md:col-span-2">
+                  <label className="block text-sm font-semibold text-slate-700 mb-2">Branch</label>
+                  {!showNewBranchForm ? (
+                    <div className="flex gap-2">
+                      <select
+                        value={formData.branch_id}
+                        onChange={(e) => setFormData({ ...formData, branch_id: e.target.value })}
+                        className="flex-1 px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+                      >
+                        <option value="">No Branch</option>
+                        {branches.map(branch => (
+                          <option key={branch.id} value={branch.id}>
+                            {branch.branch_name} {branch.branch_code ? `(${branch.branch_code})` : ''}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        onClick={() => setShowNewBranchForm(true)}
+                        className="flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700 text-white font-semibold rounded-lg transition"
+                      >
+                        <Plus className="w-4 h-4" />
+                        New
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="space-y-3 p-4 bg-green-50 border border-green-200 rounded-lg">
+                      <div className="flex items-center justify-between">
+                        <h4 className="text-sm font-bold text-green-900">Create New Branch</h4>
+                        <button
+                          type="button"
+                          onClick={() => { setShowNewBranchForm(false); setNewBranchName(''); setNewBranchCode(''); }}
+                          className="text-green-600 hover:text-green-800"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      </div>
+                      <div className="grid grid-cols-2 gap-3">
+                        <div>
+                          <label className="block text-xs font-semibold text-green-900 mb-1">Branch Name *</label>
+                          <input
+                            type="text"
+                            value={newBranchName}
+                            onChange={(e) => setNewBranchName(e.target.value)}
+                            className="w-full px-3 py-2 border border-green-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-transparent outline-none text-sm"
+                            placeholder="Main Office"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-xs font-semibold text-green-900 mb-1">Branch Code</label>
+                          <input
+                            type="text"
+                            value={newBranchCode}
+                            onChange={(e) => setNewBranchCode(e.target.value)}
+                            className="w-full px-3 py-2 border border-green-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-transparent outline-none text-sm"
+                            placeholder="HQ-001"
+                          />
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={handleCreateBranch}
+                        className="w-full px-4 py-2 bg-green-600 hover:bg-green-700 text-white font-semibold rounded-lg transition text-sm"
+                      >
+                        Create Branch
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                <div className="md:col-span-2">
+                  <label className="block text-sm font-semibold text-slate-700 mb-2">Fixed Asset Type</label>
+                  {!showNewAssetTypeForm ? (
+                    <div className="flex gap-2">
+                      <select
+                        value={formData.fixed_asset_type_id}
+                        onChange={(e) => setFormData({ ...formData, fixed_asset_type_id: e.target.value })}
+                        className="flex-1 px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+                      >
+                        <option value="">No Fixed Asset Type</option>
+                        {fixedAssetTypes.map(t => (
+                          <option key={t.id} value={t.id}>
+                            {t.type_name.trim()} {t.type_code ? `(${t.type_code})` : ''}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        onClick={() => setShowNewAssetTypeForm(true)}
+                        className="flex items-center gap-2 px-4 py-2 bg-green-600 hover:bg-green-700 text-white font-semibold rounded-lg transition"
+                      >
+                        <Plus className="w-4 h-4" />
+                        New
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="space-y-3 p-4 bg-green-50 border border-green-200 rounded-lg">
+                      <div className="flex items-center justify-between">
+                        <h4 className="text-sm font-bold text-green-900">Create New Fixed Asset Type</h4>
+                        <button
+                          type="button"
+                          onClick={() => { setShowNewAssetTypeForm(false); setNewAssetTypeName(''); setNewAssetTypeCode(''); }}
+                          className="text-green-600 hover:text-green-800"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      </div>
+                      <div className="grid grid-cols-2 gap-3">
+                        <div>
+                          <label className="block text-xs font-semibold text-green-900 mb-1">Type Name *</label>
+                          <input
+                            type="text"
+                            value={newAssetTypeName}
+                            onChange={(e) => setNewAssetTypeName(e.target.value)}
+                            className="w-full px-3 py-2 border border-green-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-transparent outline-none text-sm"
+                            placeholder="Vehicle"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-xs font-semibold text-green-900 mb-1">Type Code</label>
+                          <input
+                            type="text"
+                            value={newAssetTypeCode}
+                            onChange={(e) => setNewAssetTypeCode(e.target.value)}
+                            className="w-full px-3 py-2 border border-green-300 rounded-lg focus:ring-2 focus:ring-green-500 focus:border-transparent outline-none text-sm"
+                            placeholder="VEH"
+                          />
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={handleCreateFixedAssetType}
+                        className="w-full px-4 py-2 bg-green-600 hover:bg-green-700 text-white font-semibold rounded-lg transition text-sm"
+                      >
+                        Create Fixed Asset Type
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                <div className="md:col-span-2">
+                  <label className="block text-sm font-semibold text-slate-700 mb-2">Lease Name</label>
+                  <input
+                    type="text"
+                    value={formData.lease_name}
+                    onChange={(e) => setFormData({ ...formData, lease_name: e.target.value })}
+                    required
+                    className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+                    placeholder="Building Lease - Main Office"
+                  />
+                </div>
+
+                <div className="md:col-span-2">
+                  <label className="block text-sm font-semibold text-slate-700 mb-2">Description</label>
+                  <textarea
+                    value={formData.lease_description}
+                    onChange={(e) => setFormData({ ...formData, lease_description: e.target.value })}
+                    className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+                    rows={2}
+                    placeholder="Additional details about this lease"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-sm font-semibold text-slate-700 mb-2">Lessor Name</label>
+                  <input
+                    type="text"
+                    value={formData.lessor_name}
+                    onChange={(e) => setFormData({ ...formData, lessor_name: e.target.value })}
+                    required
+                    className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+                    placeholder="Property Management Co."
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-sm font-semibold text-slate-700 mb-2">Lessor Type</label>
+                  <select
+                    value={formData.lessor_type}
+                    onChange={(e) => setFormData({ ...formData, lessor_type: e.target.value as 'corporate' | 'individual' | 'government' | 'financial_institution' | 'other' })}
+                    className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+                  >
+                    <option value="corporate">Corporate</option>
+                    <option value="individual">Individual</option>
+                    <option value="government">Government</option>
+                    <option value="financial_institution">Financial Institution</option>
+                    <option value="other">Other</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-sm font-semibold text-slate-700 mb-2">Start Date</label>
+                  <input
+                    type="date"
+                    value={formData.lease_start_date}
+                    onChange={(e) => setFormData({ ...formData, lease_start_date: e.target.value })}
+                    required
+                    className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-sm font-semibold text-slate-700 mb-2">End Date</label>
+                  <input
+                    type="date"
+                    value={formData.lease_end_date}
+                    onChange={(e) => setFormData({ ...formData, lease_end_date: e.target.value })}
+                    required
+                    className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div>
+              <h3 className="text-lg font-bold text-slate-900 mb-4">Payment Details</h3>
+
+              <div className="mb-4 flex items-center justify-between p-3 bg-slate-50 border border-slate-200 rounded-lg">
+                <div>
+                  <p className="text-sm font-semibold text-slate-700">Variable Payment Schedule</p>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    Define different payment amounts for different periods of the lease
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setUseVariablePayments(!useVariablePayments);
+                    if (!useVariablePayments && formData.payment_amount) {
+                      setPaymentTranches([{
+                        id: crypto.randomUUID(),
+                        fromMonth: 1,
+                        toMonth: termMonths > 0 ? termMonths : 12,
+                        paymentAmount: formData.payment_amount,
+                      }]);
+                    }
+                  }}
+                  className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${useVariablePayments ? 'bg-blue-600' : 'bg-slate-300'}`}
+                >
+                  <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${useVariablePayments ? 'translate-x-6' : 'translate-x-1'}`} />
+                </button>
+              </div>
+
+              {!useVariablePayments ? (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-semibold text-slate-700 mb-2">Monthly Payment</label>
+                    <div className="relative">
+                      <span className="absolute left-4 top-2 text-slate-500">$</span>
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={formData.payment_amount}
+                        onChange={(e) => setFormData({ ...formData, payment_amount: e.target.value })}
+                        required={!useVariablePayments}
+                        className="w-full pl-8 pr-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+                        placeholder="5000.00"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-semibold text-slate-700 mb-2">Payment Timing</label>
+                    <select
+                      value={formData.payment_timing}
+                      onChange={(e) => setFormData({ ...formData, payment_timing: e.target.value as 'beginning' | 'end' })}
+                      className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+                    >
+                      <option value="beginning">Beginning of Period (Annuity Due)</option>
+                      <option value="end">End of Period (Ordinary Annuity)</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-semibold text-slate-700 mb-2">Borrowing Rate (Annual %)</label>
+                    <input
+                      type="number"
+                      step="0.0001"
+                      value={formData.incremental_borrowing_rate}
+                      onChange={(e) => setFormData({ ...formData, incremental_borrowing_rate: e.target.value })}
+                      required
+                      className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+                      placeholder="0.0500"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-semibold text-slate-700 mb-2">Residual Value Guarantee</label>
+                    <div className="relative">
+                      <span className="absolute left-4 top-2 text-slate-500">$</span>
+                      <input
+                        type="number"
+                        step="0.01"
+                        value={formData.residual_value_guarantee}
+                        onChange={(e) => setFormData({ ...formData, residual_value_guarantee: e.target.value })}
+                        className="w-full pl-8 pr-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+                        placeholder="0.00"
+                      />
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="space-y-4">
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-semibold text-slate-700 mb-2">Payment Timing</label>
+                      <select
+                        value={formData.payment_timing}
+                        onChange={(e) => setFormData({ ...formData, payment_timing: e.target.value as 'beginning' | 'end' })}
+                        className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+                      >
+                        <option value="beginning">Beginning of Period (Annuity Due)</option>
+                        <option value="end">End of Period (Ordinary Annuity)</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-sm font-semibold text-slate-700 mb-2">Borrowing Rate (Annual %)</label>
+                      <input
+                        type="number"
+                        step="0.0001"
+                        value={formData.incremental_borrowing_rate}
+                        onChange={(e) => setFormData({ ...formData, incremental_borrowing_rate: e.target.value })}
+                        required
+                        className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+                        placeholder="0.0500"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-sm font-semibold text-slate-700 mb-2">Residual Value Guarantee</label>
+                      <div className="relative">
+                        <span className="absolute left-4 top-2 text-slate-500">$</span>
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={formData.residual_value_guarantee}
+                          onChange={(e) => setFormData({ ...formData, residual_value_guarantee: e.target.value })}
+                          className="w-full pl-8 pr-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+                          placeholder="0.00"
+                        />
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="border border-slate-200 rounded-lg overflow-hidden">
+                    <div className="bg-slate-50 px-4 py-3 border-b border-slate-200 flex items-center justify-between">
+                      <div>
+                        <h4 className="text-sm font-bold text-slate-800">Payment Periods</h4>
+                        {termMonths > 0 && (
+                          <p className="text-xs text-slate-500 mt-0.5">
+                            Lease term: {termMonths} months
+                            {coverage.covered < coverage.total && (
+                              <span className="ml-2 text-amber-600">
+                                ({coverage.covered}/{coverage.total} months covered)
+                              </span>
+                            )}
+                            {isFullyCovered && (
+                              <span className="ml-2 text-green-600">
+                                (fully covered)
+                              </span>
+                            )}
+                          </p>
+                        )}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={addTranche}
+                        className="flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold rounded-lg transition"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                        Add Period
+                      </button>
+                    </div>
+
+                    <div className="divide-y divide-slate-100">
+                      {paymentTranches.length === 0 && (
+                        <div className="px-4 py-6 text-center text-sm text-slate-400">
+                          No payment periods defined. Click "Add Period" to start.
+                        </div>
+                      )}
+
+                      {paymentTranches.map((tranche, index) => (
+                        <div key={tranche.id} className="px-4 py-3 flex items-center gap-3 bg-white hover:bg-slate-50 transition-colors">
+                          <div className="flex-shrink-0 w-6 h-6 bg-blue-100 text-blue-700 rounded-full flex items-center justify-center text-xs font-bold">
+                            {index + 1}
+                          </div>
+
+                          <div className="flex items-center gap-2 flex-1 flex-wrap">
+                            <div className="flex items-center gap-2">
+                              <label className="text-xs text-slate-500 whitespace-nowrap">Month</label>
+                              <input
+                                type="number"
+                                min={1}
+                                max={termMonths > 0 ? termMonths : undefined}
+                                value={tranche.fromMonth}
+                                onChange={(e) => updateTranche(tranche.id, 'fromMonth', parseInt(e.target.value) || 1)}
+                                className="w-20 px-2 py-1.5 border border-slate-300 rounded text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none text-center"
+                              />
+                              <span className="text-xs text-slate-400">to</span>
+                              <input
+                                type="number"
+                                min={tranche.fromMonth}
+                                max={termMonths > 0 ? termMonths : undefined}
+                                value={tranche.toMonth}
+                                onChange={(e) => updateTranche(tranche.id, 'toMonth', parseInt(e.target.value) || tranche.fromMonth)}
+                                className="w-20 px-2 py-1.5 border border-slate-300 rounded text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none text-center"
+                              />
+                            </div>
+
+                            <div className="flex items-center gap-2 flex-1">
+                              <label className="text-xs text-slate-500 whitespace-nowrap">Payment</label>
+                              <div className="relative flex-1 min-w-[120px]">
+                                <span className="absolute left-2.5 top-1.5 text-slate-400 text-sm">$</span>
+                                <input
+                                  type="number"
+                                  step="0.01"
+                                  min={0}
+                                  value={tranche.paymentAmount}
+                                  onChange={(e) => updateTranche(tranche.id, 'paymentAmount', e.target.value)}
+                                  className="w-full pl-6 pr-3 py-1.5 border border-slate-300 rounded text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+                                  placeholder="0.00"
+                                />
+                              </div>
+                            </div>
+
+                            {termMonths > 0 && tranche.fromMonth <= termMonths && (
+                              <span className="text-xs text-slate-400">
+                                {Math.min(tranche.toMonth, termMonths) - tranche.fromMonth + 1} mo
+                              </span>
+                            )}
+                          </div>
+
+                          <button
+                            type="button"
+                            onClick={() => removeTranche(tranche.id)}
+                            className="flex-shrink-0 text-slate-400 hover:text-red-500 transition-colors p-1"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+
+                    {hasGaps && (
+                      <div className="px-4 py-2.5 bg-amber-50 border-t border-amber-100 flex items-center gap-2">
+                        <AlertTriangle className="w-4 h-4 text-amber-500 flex-shrink-0" />
+                        <p className="text-xs text-amber-700">
+                          Some months are not covered by any payment period. Uncovered periods will use $0 as the payment.
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div>
+              <h3 className="text-lg font-bold text-slate-900 mb-4">Additional Costs</h3>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div>
+                  <label className="block text-sm font-semibold text-slate-700 mb-2">Initial Direct Costs</label>
+                  <div className="relative">
+                    <span className="absolute left-4 top-2 text-slate-500">$</span>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={formData.initial_direct_costs}
+                      onChange={(e) => setFormData({ ...formData, initial_direct_costs: e.target.value })}
+                      className="w-full pl-8 pr-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+                      placeholder="0.00"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-sm font-semibold text-slate-700 mb-2">Lease Incentives</label>
+                  <div className="relative">
+                    <span className="absolute left-4 top-2 text-slate-500">$</span>
+                    <input
+                      type="number"
+                      step="0.01"
+                      value={formData.lease_incentives}
+                      onChange={(e) => setFormData({ ...formData, lease_incentives: e.target.value })}
+                      className="w-full pl-8 pr-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+                      placeholder="0.00"
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="bg-slate-50 rounded-lg p-4 border border-slate-200">
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="text-lg font-bold text-slate-900">Classification</h3>
+                <button
+                  type="button"
+                  onClick={() => setShowClassificationWizard(!showClassificationWizard)}
+                  className="flex items-center gap-2 px-3 py-2 text-sm bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg transition"
+                >
+                  <HelpCircle className="w-4 h-4" />
+                  Classification Wizard
+                </button>
+              </div>
+
+              {showClassificationWizard && (
+                <div className="space-y-4 mb-4 bg-white rounded-lg p-4 border border-slate-300">
+                  <p className="text-sm text-slate-600 font-medium">
+                    Answer these questions to determine if this is an operating or finance lease per ASC 842:
+                  </p>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                      <div className="flex items-center justify-between mb-2">
+                        <label className="block text-sm font-semibold text-slate-700">Lease Fair Value</label>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const calculatedValue = calculateAssetFairValue();
+                            setFormData({ ...formData, asset_fair_value: calculatedValue.toFixed(2) });
+                          }}
+                          className="text-xs text-blue-600 hover:text-blue-700 font-semibold"
+                        >
+                          Auto-Calculate
+                        </button>
+                      </div>
+                      <div className="relative">
+                        <span className="absolute left-4 top-2 text-slate-500">$</span>
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={formData.asset_fair_value}
+                          onChange={(e) => setFormData({ ...formData, asset_fair_value: e.target.value })}
+                          className="w-full pl-8 pr-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none text-sm"
+                          placeholder="0.00"
+                        />
+                      </div>
+                      <p className="text-xs text-slate-500 mt-1">Leave at 0 to skip the fair value test, or enter the asset's independent market value</p>
+                    </div>
+
+                    <div>
+                      <label className="block text-sm font-semibold text-slate-700 mb-2">Asset Fair Value</label>
+                      <div className="relative">
+                        <span className="absolute left-4 top-2 text-slate-500">$</span>
+                        <input
+                          type="number"
+                          step="0.01"
+                          value={formData.asset_market_value}
+                          onChange={(e) => setFormData({ ...formData, asset_market_value: e.target.value })}
+                          className="w-full pl-8 pr-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none text-sm"
+                          placeholder="0.00"
+                        />
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="block text-sm font-semibold text-slate-700 mb-2">Asset Economic Life (Years)</label>
+                      <input
+                        type="number"
+                        step="0.1"
+                        value={formData.asset_economic_life_years}
+                        onChange={(e) => setFormData({ ...formData, asset_economic_life_years: e.target.value })}
+                        className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none text-sm"
+                        placeholder="10"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="space-y-3">
+                    {(() => {
+                      const leaseFV = parseFloat(formData.asset_fair_value) || 0;
+                      const assetFV = parseFloat(formData.asset_market_value) || 0;
+                      const fvPct = assetFV > 0 ? (leaseFV / assetFV) * 100 : null;
+                      const leaseTerm = calculateTermMonths();
+                      const econLife = parseFloat(formData.asset_economic_life_years) || 0;
+                      const econLifeMonths = econLife * 12;
+                      const econPct = econLifeMonths > 0 ? (leaseTerm / econLifeMonths) * 100 : null;
+                      const fvMet = fvPct !== null && fvPct >= 90;
+                      const econMet = econPct !== null && econPct >= 75;
+                      return (
+                        <>
+                          <label className="flex items-center gap-3 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={fvPct !== null ? fvMet : false}
+                              readOnly
+                              className="w-5 h-5 text-blue-600 rounded focus:ring-2 focus:ring-blue-500 cursor-default"
+                            />
+                            <span className="text-sm font-medium text-slate-700 flex items-center gap-2">
+                              Is Lease Fair Value &ge; 90% of Asset Fair Value?
+                              {fvPct !== null ? (
+                                <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${fvMet ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-600'}`}>
+                                  {fvPct.toFixed(1)}%
+                                </span>
+                              ) : (
+                                <span className="text-xs text-slate-400">Enter both fair values</span>
+                              )}
+                            </span>
+                          </label>
+
+                          <label className="flex items-center gap-3 cursor-pointer">
+                            <input
+                              type="checkbox"
+                              checked={econPct !== null ? econMet : false}
+                              readOnly
+                              className="w-5 h-5 text-blue-600 rounded focus:ring-2 focus:ring-blue-500 cursor-default"
+                            />
+                            <span className="text-sm font-medium text-slate-700 flex items-center gap-2">
+                              Is Asset Economic Life &ge; 75% of Lease Term?
+                              {econPct !== null ? (
+                                <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${econMet ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-600'}`}>
+                                  {econPct.toFixed(1)}%
+                                </span>
+                              ) : (
+                                <span className="text-xs text-slate-400">Enter lease term &amp; economic life</span>
+                              )}
+                            </span>
+                          </label>
+                        </>
+                      );
+                    })()}
+
+                    <label className="flex items-center gap-3 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={formData.transfer_ownership}
+                        onChange={(e) => setFormData({ ...formData, transfer_ownership: e.target.checked })}
+                        className="w-5 h-5 text-blue-600 rounded focus:ring-2 focus:ring-blue-500"
+                      />
+                      <span className="text-sm font-medium text-slate-700">
+                        Lease transfers ownership to lessee at end of term
+                      </span>
+                    </label>
+
+                    <div className="space-y-2">
+                      <label className="flex items-center gap-3 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={formData.purchase_option}
+                          onChange={(e) => setFormData({ ...formData, purchase_option: e.target.checked })}
+                          className="w-5 h-5 text-blue-600 rounded focus:ring-2 focus:ring-blue-500"
+                        />
+                        <span className="text-sm font-medium text-slate-700">Lessee has purchase option</span>
+                      </label>
+
+                      {formData.purchase_option && (
+                        <div className="ml-8">
+                          <label className="block text-xs font-semibold text-slate-600 mb-1">Purchase Option Price</label>
+                          <div className="relative">
+                            <span className="absolute left-3 top-1.5 text-slate-500 text-sm">$</span>
+                            <input
+                              type="number"
+                              step="0.01"
+                              value={formData.purchase_option_price}
+                              onChange={(e) => setFormData({ ...formData, purchase_option_price: e.target.value })}
+                              className="w-full pl-7 pr-3 py-1.5 border border-slate-300 rounded text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+                              placeholder="0.00"
+                            />
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    <label className="flex items-center gap-3 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={formData.specialized_asset}
+                        onChange={(e) => setFormData({ ...formData, specialized_asset: e.target.checked })}
+                        className="w-5 h-5 text-blue-600 rounded focus:ring-2 focus:ring-blue-500"
+                      />
+                      <span className="text-sm font-medium text-slate-700">
+                        Asset is specialized with no alternative use to lessor
+                      </span>
+                    </label>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={runClassificationWizard}
+                    className="w-full px-4 py-2 bg-green-600 hover:bg-green-700 text-white font-semibold rounded-lg transition text-sm"
+                  >
+                    Determine Classification
+                  </button>
+                </div>
+              )}
+
+              <div>
+                <label className="block text-sm font-semibold text-slate-700 mb-2">Lease Classification</label>
+                <select
+                  value={formData.lease_classification}
+                  onChange={(e) => setFormData({ ...formData, lease_classification: e.target.value as 'operating' | 'finance', auto_classified: false })}
+                  className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none"
+                >
+                  <option value="operating">Operating Lease</option>
+                  <option value="finance">Finance Lease</option>
+                </select>
+                {formData.auto_classified && (
+                  <p className="text-xs text-green-600 mt-1">Auto-classified using ASC 842 criteria</p>
+                )}
+              </div>
+            </div>
+          </div>
+
+          <div className="flex gap-3 mt-8 pt-6 border-t border-slate-200">
+            <button
+              type="button"
+              onClick={onClose}
+              className="flex-1 px-6 py-3 border border-slate-300 text-slate-700 font-semibold rounded-lg hover:bg-slate-50 transition"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={loading}
+              className="flex-1 px-6 py-3 bg-blue-600 hover:bg-blue-700 text-white font-semibold rounded-lg transition disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {loading ? 'Saving...' : lease ? 'Update Lease' : 'Create Lease'}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}

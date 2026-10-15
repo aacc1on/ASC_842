@@ -1,0 +1,44 @@
+[functions.recreate-user]
+verify_jwt = true
+
+[functions.stripe-checkout]
+verify_jwt = true
+
+[functions.stripe-manage-subscription]
+verify_jwt = true
+
+[functions.stripe-customer-portal]
+verify_jwt = true
+
+[functions.stripe-change-plan]
+verify_jwt = true
+
+[functions.stripe-webhook]
+verify_jwt = false
+
+[functions.stripe-billing-sync]
+verify_jwt = true
+
+[functions.admin-update-user-password]
+verify_jwt = true
+
+[functions.remove-user]
+verify_jwt = true
+
+[functions.export-backup]
+verify_jwt = true
+
+[functions.reopen-month-end]
+verify_jwt = true
+
+[functions.platform-admin-delete-user]
+verify_jwt = true
+
+[functions.platform-admin-edit-user]
+verify_jwt = true
+
+[functions.error-alert]
+verify_jwt = true
+
+[functions.health]
+verify_jwt = false

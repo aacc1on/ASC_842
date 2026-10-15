@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['**']
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm audit --omit=dev --audit-level=high
+
+      - name: Migration hygiene
+        run: node scripts/check-migrations.mjs
+
+      - name: Migrations rebuild an empty database (staging parity) and demo seed loads
+        run: node scripts/check-migrations-empty-db.mjs --seed supabase/seed-staging.sql
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test with coverage thresholds (hooks >= 70% lines / 60% branches, utils >= 90% lines)
+        run: npm run test:coverage
+        env:
+          TZ: UTC
+
+      - name: Build
+        run: npm run build
+        env:
+          VITE_SUPABASE_URL: http://localhost:54321
+          VITE_SUPABASE_ANON_KEY: ci-placeholder-anon-key

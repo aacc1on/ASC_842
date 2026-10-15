@@ -1,0 +1,480 @@
+name: Staging
+
+# Updates the separate STAGING Supabase project. Production is never targeted.
+# - Push to main touching supabase/**: apply new migrations + deploy all edge functions.
+# - Manual run with confirm = RESET-STAGING: wipe staging completely, rebuild from every migration,
+#   load demo data (supabase/seed-staging.sql), generate + verify the demo schedules and journal entries,
+#   deploy all edge functions.
+# Every failure is reported as an ::error:: annotation (plus the job summary) with the last output lines,
+# because GitHub does not always keep readable step logs. Secret values are scrubbed from that output.
+
+on:
+  push:
+    branches: [main]
+    paths: ['supabase/**']
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type RESET-STAGING to wipe and rebuild staging. Leave empty to only apply new migrations and deploy functions.'
+        required: false
+        default: ''
+        type: string
+
+concurrency:
+  group: staging
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  STAGING_REF: kiakzaihvghxgkvwqufe
+  PROD_REF: eieariefpfzqalskgubn
+  SUPABASE_API: https://api.supabase.com/v1
+  SUPABASE_CLI_VERSION: 2.120.0
+  # sha256 of supabase_2.120.0_linux_amd64.tar.gz from the release's checksums.txt; update together with the version.
+  SUPABASE_CLI_SHA256: 7074584113aa00495beeac661c41fb09f1ddd0a483cd7333894b0d080086dc6e
+
+jobs:
+  staging:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check secrets
+        id: secrets
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          STAGING_DB_PASSWORD: ${{ secrets.STAGING_DB_PASSWORD }}
+        run: |
+          if [ -z "$SUPABASE_ACCESS_TOKEN" ] || [ -z "$STAGING_DB_PASSWORD" ]; then
+            echo "::notice title=Staging skipped::SUPABASE_ACCESS_TOKEN and/or STAGING_DB_PASSWORD are not set. Add both under Settings > Secrets and variables > Actions to enable staging updates."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Decide mode
+        id: mode
+        if: steps.secrets.outputs.ready == 'true'
+        env:
+          CONFIRM: ${{ github.event.inputs.confirm }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "$CONFIRM" = "RESET-STAGING" ]; then
+            echo "mode=reset" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Staging RESET::Staging will be wiped and rebuilt from scratch."
+          elif [ -n "$CONFIRM" ]; then
+            echo "::error::confirm must be exactly RESET-STAGING (or empty for a normal update). Nothing was changed."
+            exit 1
+          else
+            echo "mode=update" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v5
+        if: steps.secrets.outputs.ready == 'true'
+
+      - name: Guard — staging only, never production
+        if: steps.secrets.outputs.ready == 'true'
+        run: |
+          set -euo pipefail
+          [ "$STAGING_REF" = "kiakzaihvghxgkvwqufe" ] || { echo "::error::STAGING_REF was changed"; exit 1; }
+          [ "$STAGING_REF" != "$PROD_REF" ] || { echo "::error::Staging ref equals the production ref"; exit 1; }
+          # The production ref may only appear on the PROD_REF line of this workflow and nowhere under supabase/.
+          if grep -n "$PROD_REF" .github/workflows/staging.yml | grep -v "PROD_REF: $PROD_REF"; then
+            echo "::error::A command in staging.yml references the production project"; exit 1
+          fi
+          if grep -rIl "$PROD_REF" supabase/; then
+            echo "::error::supabase/ references the production project"; exit 1
+          fi
+          rm -rf supabase/.temp
+          echo "Target: $STAGING_REF (staging)"
+
+      - name: Prepare error reporting helpers
+        if: steps.secrets.outputs.ready == 'true'
+        run: |
+          cat > "$RUNNER_TEMP/staging-helpers.sh" <<'HELPERS'
+          LAST_OUT="$RUNNER_TEMP/last-output.txt"
+          CLI_STDOUT="$RUNNER_TEMP/cli-stdout.txt"
+          HTTP_STATUS=""
+          SERVICE_KEY="${SERVICE_KEY:-}"
+          : > "$LAST_OUT"
+
+          # Scrub secret values and anything shaped like a token, key or password-bearing URL.
+          sanitize() {
+            local s v
+            s="$(cat)"
+            for v in "${SUPABASE_ACCESS_TOKEN:-}" "${SUPABASE_DB_PASSWORD:-}" "${SERVICE_KEY:-}"; do
+              if [ -n "$v" ]; then s="${s//"$v"/***}"; fi
+            done
+            printf '%s\n' "$s" | sed -E \
+              -e 's/sbp_[A-Za-z0-9]+/sbp_***/g' \
+              -e 's/sb_secret_[A-Za-z0-9_-]+/sb_secret_***/g' \
+              -e 's/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/***/g' \
+              -e 's#(postgres(ql)?://[^:/@[:space:]]+:)[^@[:space:]]+@#\1***@#g'
+          }
+
+          gh_escape() {
+            local s="$1"
+            s="${s//'%'/'%25'}"
+            s="${s//$'\r'/'%0D'}"
+            s="${s//$'\n'/'%0A'}"
+            printf '%s' "$s"
+          }
+
+          annotate_error() {
+            echo "::error title=$(gh_escape "$1")::$(gh_escape "$2")"
+            { echo "### $1"; echo; echo '```'; printf '%s\n' "$2"; echo '```'; echo; } >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          fail_with_output() {
+            local lines
+            lines="$(tail -n 15 "$LAST_OUT" 2>/dev/null || true)"
+            [ -n "$lines" ] || lines="(no output)"
+            annotate_error "$1" "$2"$'\n'"Last output lines:"$'\n'"$lines"
+          }
+
+          # run_cli loud|quiet cmd... : sanitized stdout+stderr -> $LAST_OUT, raw stdout -> $CLI_STDOUT.
+          run_cli() {
+            local mode="$1" rc=0
+            shift
+            "$@" < /dev/null > "$CLI_STDOUT" 2> "$LAST_OUT.err" || rc=$?
+            { cat "$CLI_STDOUT"; cat "$LAST_OUT.err"; } | sanitize > "$LAST_OUT"
+            rm -f "$LAST_OUT.err"
+            if [ "$mode" = loud ]; then rm -f "$CLI_STDOUT"; fi
+            if [ "$mode" = loud ] || [ "$rc" -ne 0 ]; then cat "$LAST_OUT"; fi
+            return "$rc"
+          }
+
+          explain_cli_failure() {
+            if grep -qiE 'password authentication failed|SASL' "$LAST_OUT"; then
+              annotate_error "Wrong database password" "STAGING_DB_PASSWORD is wrong — reset it in Supabase > Lease > Database settings and update the GitHub secret."
+            elif grep -qiE 'unauthorized|status 401|invalid access token|access token not provided' "$LAST_OUT"; then
+              annotate_error "Access token rejected" "SUPABASE_ACCESS_TOKEN was rejected by Supabase (create a new token)."
+            elif grep -qiE 'project_id|config\.toml' "$LAST_OUT"; then
+              annotate_error "Config file rejected" "The Supabase CLI could not use supabase/config.toml (see the output lines below)."
+            elif grep -qiE 'i/o timeout|timed out|connection refused|no route to host|network is unreachable|could not translate host' "$LAST_OUT"; then
+              annotate_error "Staging database unreachable" "The CLI could not reach the staging database. It may be paused, restoring or under maintenance — check the project in the Supabase dashboard."
+            fi
+            fail_with_output "$1" "$2"
+          }
+
+          # http METHOD URL [curl args...] : sanitized body -> $LAST_OUT, status -> $HTTP_STATUS; succeeds on 2xx.
+          http() {
+            local method="$1" url="$2" rc=0
+            shift 2
+            HTTP_STATUS="$(curl -sS -o "$LAST_OUT.body" -w '%{http_code}' -X "$method" "$url" "$@" 2> "$LAST_OUT.err")" || rc=$?
+            { cat "$LAST_OUT.err"; cat "$LAST_OUT.body" 2>/dev/null; } | sanitize > "$LAST_OUT"
+            rm -f "$LAST_OUT.err" "$LAST_OUT.body"
+            [ "$rc" -eq 0 ] && [ "${HTTP_STATUS:-0}" -ge 200 ] 2>/dev/null && [ "${HTTP_STATUS:-0}" -lt 300 ]
+          }
+
+          run_sql() {
+            local title="$1"
+            jq -n --arg q "$2" '{query: $q}' > "$RUNNER_TEMP/query.json"
+            if ! http POST "$SUPABASE_API/projects/$STAGING_REF/database/query" \
+                -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" -H "Content-Type: application/json" \
+                --data-binary "@$RUNNER_TEMP/query.json"; then
+              cat "$LAST_OUT"
+              if [ "$HTTP_STATUS" = 401 ] || [ "$HTTP_STATUS" = 403 ]; then
+                annotate_error "Access token rejected" "SUPABASE_ACCESS_TOKEN was rejected by Supabase (create a new token)."
+              fi
+              fail_with_output "$title" "The Supabase SQL API returned HTTP ${HTTP_STATUS:-none}."
+              return 1
+            fi
+            cat "$LAST_OUT"
+          }
+
+          # Confirms the CLI is linked to staging, via the link file or, if absent, the CLI's own project list.
+          assert_linked() {
+            local linked=""
+            if [ -f supabase/.temp/project-ref ]; then
+              linked="$(tr -d '[:space:]' < supabase/.temp/project-ref)"
+            elif run_cli quiet supabase projects list -o json; then
+              linked="$(jq -r '[.[] | select(.linked == true) | (.ref // .id)][0] // empty' "$CLI_STDOUT" 2>/dev/null || true)"
+              rm -f "$CLI_STDOUT"
+            else
+              rm -f "$CLI_STDOUT"
+              explain_cli_failure "Link check failed" "Could not confirm which project the Supabase CLI is linked to."
+              return 1
+            fi
+            if [ "$linked" != "$STAGING_REF" ] || [ "$linked" = "$PROD_REF" ]; then
+              annotate_error "Not linked to staging" "The Supabase CLI is linked to '${linked:-nothing}', expected staging $STAGING_REF. Nothing further was changed."
+              return 1
+            fi
+            echo "Linked to staging: $linked"
+          }
+          HELPERS
+          echo "Helpers ready."
+
+      - name: Install Supabase CLI (pinned)
+        if: steps.secrets.outputs.ready == 'true'
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/staging-helpers.sh"
+          v="$SUPABASE_CLI_VERSION"
+          dir="$RUNNER_TEMP/supabase-cli"
+          base="https://github.com/supabase/cli/releases/download/v$v"
+          mkdir -p "$dir"
+          asset="supabase_${v}_linux_amd64.tar.gz"
+          if ! curl -fsSL --retry 3 -o "$dir/cli.tar.gz" "$base/$asset" 2> "$LAST_OUT"; then
+            fail_with_output "CLI download failed" "Could not download $asset (Supabase CLI v$v) from GitHub releases."
+            exit 1
+          fi
+          if ! curl -fsSL --retry 3 -o "$dir/checksums.txt" "$base/checksums.txt" 2> "$LAST_OUT"; then
+            fail_with_output "CLI checksum unavailable" "Could not download checksums.txt for Supabase CLI v$v. Nothing was changed."
+            exit 1
+          fi
+          listed="$(awk -v a="$asset" '$2 == a {print $1}' "$dir/checksums.txt")"
+          actual="$(sha256sum "$dir/cli.tar.gz" | awk '{print $1}')"
+          if [ -z "$listed" ]; then
+            annotate_error "CLI checksum not listed" "checksums.txt for Supabase CLI v$v has no entry for $asset. Nothing was changed."
+            exit 1
+          fi
+          if [ "$listed" != "$SUPABASE_CLI_SHA256" ] || [ "$actual" != "$SUPABASE_CLI_SHA256" ]; then
+            annotate_error "CLI checksum mismatch" "Supabase CLI v$v: pinned $SUPABASE_CLI_SHA256, published $listed, downloaded $actual. Nothing was changed."
+            exit 1
+          fi
+          echo "Checksum verified: $actual"
+          if ! tar -xzf "$dir/cli.tar.gz" -C "$dir" > "$LAST_OUT" 2>&1 || [ ! -x "$dir/supabase" ]; then
+            fail_with_output "CLI install failed" "The Supabase CLI v$v archive could not be unpacked."
+            exit 1
+          fi
+          installed="$("$dir/supabase" --version 2>/dev/null | head -n 1 | tr -d '[:space:]v')"
+          if [ "$installed" != "$v" ]; then
+            annotate_error "CLI version mismatch" "Expected Supabase CLI $v but the installed binary reports '$installed'."
+            exit 1
+          fi
+          echo "$dir" >> "$GITHUB_PATH"
+          echo "Supabase CLI $installed installed."
+
+      - name: Check access token and staging project
+        if: steps.secrets.outputs.ready == 'true'
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/staging-helpers.sh"
+          if ! http GET "$SUPABASE_API/projects" -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN"; then
+            case "$HTTP_STATUS" in
+              401|403) annotate_error "Access token rejected" "SUPABASE_ACCESS_TOKEN was rejected by Supabase (create a new token under Account > Access Tokens and update the GitHub secret)." ;;
+              *) fail_with_output "Supabase API check failed" "Listing projects with SUPABASE_ACCESS_TOKEN failed (HTTP ${HTTP_STATUS:-none})." ;;
+            esac
+            exit 1
+          fi
+          if ! status="$(jq -r --arg r "$STAGING_REF" '[.[] | select((.ref // .id) == $r)][0].status // empty' "$LAST_OUT" 2>/dev/null)"; then
+            fail_with_output "Supabase API check failed" "The project list returned by Supabase was not valid JSON."
+            exit 1
+          fi
+          if [ -z "$status" ]; then
+            annotate_error "Staging project not visible" "the token's account cannot see the staging project $STAGING_REF. Create the token while signed in to the account that owns the Lease staging project."
+            exit 1
+          fi
+          echo "Access token accepted. Staging project status: $status"
+          case "$status" in
+            ACTIVE_HEALTHY) ;;
+            INACTIVE|PAUSING|PAUSED|RESTORING|PAUSE_FAILED|RESTORE_FAILED|REMOVED|GOING_DOWN)
+              annotate_error "Staging project not running" "Staging project $STAGING_REF is $status. Restore it in the Supabase dashboard, then run this workflow again."
+              exit 1 ;;
+            *) echo "::warning title=Staging project status::Staging project is $status (not ACTIVE_HEALTHY); continuing." ;;
+          esac
+
+      - name: Link staging project
+        if: steps.secrets.outputs.ready == 'true'
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.STAGING_DB_PASSWORD }}
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/staging-helpers.sh"
+          # config.toml in the repo only lists functions; give this run's copy a project_id so the CLI accepts it.
+          if ! grep -qE '^[[:space:]]*project_id[[:space:]]*=' supabase/config.toml; then
+            { printf 'project_id = "%s"\n\n' "$STAGING_REF"; cat supabase/config.toml; } > "$RUNNER_TEMP/config.toml"
+            mv "$RUNNER_TEMP/config.toml" supabase/config.toml
+            echo "Added project_id to this run's copy of supabase/config.toml (not committed)."
+          fi
+          if ! run_cli loud supabase link --project-ref "$STAGING_REF" --password "$SUPABASE_DB_PASSWORD"; then
+            explain_cli_failure "Link failed" "supabase link --project-ref $STAGING_REF failed."
+            exit 1
+          fi
+          assert_linked
+
+      - name: Apply new migrations
+        if: steps.mode.outputs.mode == 'update'
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.STAGING_DB_PASSWORD }}
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/staging-helpers.sh"
+          assert_linked
+          if ! run_cli loud supabase db push --linked --include-all --yes; then
+            explain_cli_failure "Migrations failed" "supabase db push to staging failed."
+            exit 1
+          fi
+
+      - name: RESET — empty and remove every storage bucket
+        if: steps.mode.outputs.mode == 'reset'
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/staging-helpers.sh"
+          assert_linked
+          if ! run_cli quiet supabase projects api-keys --project-ref "$STAGING_REF" -o json; then
+            rm -f "$CLI_STDOUT"
+            explain_cli_failure "Service key read failed" "Could not read the staging API keys with SUPABASE_ACCESS_TOKEN."
+            exit 1
+          fi
+          SERVICE_KEY="$(jq -r '[.[] | select(.name == "service_role")][0].api_key // empty' "$CLI_STDOUT" 2>/dev/null || true)"
+          rm -f "$CLI_STDOUT"
+          if [ -z "$SERVICE_KEY" ]; then
+            fail_with_output "Service key read failed" "The staging API key list has no service_role key."
+            exit 1
+          fi
+          echo "::add-mask::$SERVICE_KEY"
+          base="https://$STAGING_REF.supabase.co/storage/v1"
+          auth=(-H "Authorization: Bearer $SERVICE_KEY" -H "apikey: $SERVICE_KEY")
+          if ! http GET "$base/bucket" "${auth[@]}"; then
+            fail_with_output "Storage wipe failed" "Listing staging storage buckets failed (HTTP ${HTTP_STATUS:-none})."
+            exit 1
+          fi
+          if ! buckets="$(jq -r '.[].id' "$LAST_OUT" 2>/dev/null)"; then
+            fail_with_output "Storage wipe failed" "The staging bucket list was not valid JSON."
+            exit 1
+          fi
+          for bucket in $buckets; do
+            echo "Emptying and deleting bucket: $bucket"
+            for attempt in 1 2 3 4 5; do
+              http POST "$base/bucket/$bucket/empty" "${auth[@]}" || echo "Empty attempt $attempt for $bucket returned HTTP ${HTTP_STATUS:-none}"
+              if http DELETE "$base/bucket/$bucket" "${auth[@]}"; then break; fi
+              if [ "$attempt" = 5 ]; then
+                fail_with_output "Storage wipe failed" "Could not delete storage bucket $bucket after 5 attempts (HTTP ${HTTP_STATUS:-none})."
+                exit 1
+              fi
+              sleep 5
+            done
+          done
+          echo "Storage is empty."
+
+      - name: RESET — drop leftover app schemas
+        if: steps.mode.outputs.mode == 'reset'
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/staging-helpers.sh"
+          sql=$(cat <<'SQL'
+          DO $$
+          DECLARE s text;
+          BEGIN
+            FOR s IN
+              SELECT nspname FROM pg_namespace
+              WHERE nspname NOT IN ('public', 'auth', 'storage', 'extensions', 'graphql', 'graphql_public', 'realtime',
+                                    'vault', 'pgsodium', 'pgsodium_masks', 'net', 'cron', 'pgbouncer', 'information_schema',
+                                    'supabase_functions', 'supabase_migrations', 'pgmq', 'pgtle', 'topology', 'tiger', 'tiger_data')
+                AND nspname NOT LIKE 'pg\_%' AND nspname NOT LIKE '\_%' AND nspname NOT LIKE 'supabase\_%'
+            LOOP
+              RAISE NOTICE 'Dropping schema %', s;
+              EXECUTE format('DROP SCHEMA %I CASCADE', s);
+            END LOOP;
+          END $$;
+          SQL
+          )
+          run_sql "Schema cleanup failed" "$sql" || exit 1
+
+      - name: RESET — wipe database and re-apply every migration
+        if: steps.mode.outputs.mode == 'reset'
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.STAGING_DB_PASSWORD }}
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/staging-helpers.sh"
+          assert_linked
+          if ! run_cli loud supabase db reset --linked --no-seed --yes; then
+            explain_cli_failure "Database reset failed" "supabase db reset on staging failed."
+            exit 1
+          fi
+
+      - name: RESET — delete all sign-ins and load demo data
+        if: steps.mode.outputs.mode == 'reset'
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/staging-helpers.sh"
+          run_sql "Sign-in deletion failed" "DELETE FROM auth.users;" || exit 1
+          run_sql "Demo data load failed" "$(cat supabase/seed-staging.sql)" || exit 1
+          run_sql "Demo data check failed" "SELECT lease_classification, count(*) AS leases FROM public.leases GROUP BY 1 ORDER BY 1;" || exit 1
+          leases="$(jq '[.[].leases | tonumber] | add // 0' "$LAST_OUT" 2>/dev/null || echo 0)"
+          if [ "$leases" -eq 0 ]; then
+            fail_with_output "Demo data check failed" "The seed ran but staging has no demo leases."
+            exit 1
+          fi
+          echo "Demo data loaded: $leases leases."
+
+      - uses: actions/setup-node@v5
+        if: steps.mode.outputs.mode == 'reset'
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: RESET — generate demo schedules and journal entries
+        if: steps.mode.outputs.mode == 'reset'
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/staging-helpers.sh"
+          if ! run_cli quiet npm ci --no-audit --no-fund; then
+            fail_with_output "Demo schedule generation failed" "npm ci failed, so the app's calculation code could not be loaded."
+            exit 1
+          fi
+          if ! run_cli quiet supabase projects api-keys --project-ref "$STAGING_REF" -o json; then
+            rm -f "$CLI_STDOUT"
+            explain_cli_failure "Anon key read failed" "Could not read the staging API keys with SUPABASE_ACCESS_TOKEN."
+            exit 1
+          fi
+          anon_key="$(jq -r '[.[] | select(.name == "anon")][0].api_key // empty' "$CLI_STDOUT" 2>/dev/null || true)"
+          rm -f "$CLI_STDOUT"
+          if [ -z "$anon_key" ]; then
+            fail_with_output "Anon key read failed" "The staging API key list has no anon key."
+            exit 1
+          fi
+          echo "::add-mask::$anon_key"
+          # Same calculation code and server functions the app uses when a lease is saved and its journal refreshed.
+          if ! run_cli loud env SUPABASE_URL="https://$STAGING_REF.supabase.co" SUPABASE_ANON_KEY="$anon_key" \
+              node scripts/staging/generate-demo-schedules.mjs; then
+            fail_with_output "Demo schedule generation failed" "Generating amortization schedules and journal entries for the demo leases failed."
+            exit 1
+          fi
+
+      - name: RESET — verify demo schedules and journal entries
+        if: steps.mode.outputs.mode == 'reset'
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/staging-helpers.sh"
+          run_sql "Demo data verification failed" "$(cat scripts/staging/verify-demo-data.sql)" || exit 1
+          if ! problems="$(jq -r 'if (.[0].problems | type) == "array" then .[0].problems[] else error("no result") end' "$LAST_OUT" 2>/dev/null)"; then
+            fail_with_output "Demo data verification failed" "The verification query returned an unexpected result."
+            exit 1
+          fi
+          if [ -n "$problems" ]; then
+            annotate_error "Demo data verification failed" "$problems"
+            exit 1
+          fi
+          jq -r '.[0] | "Verified: \(.leases) demo leases, \(.schedule_rows) schedule rows, \(.journal_entries) journal entries, debits \(.total_debits) = credits \(.total_credits); leases_missing_amortization has 0 demo rows."' "$LAST_OUT"
+
+      - name: Deploy all edge functions
+        if: steps.mode.outputs.mode == 'update' || steps.mode.outputs.mode == 'reset'
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/staging-helpers.sh"
+          assert_linked
+          if ! run_cli loud supabase functions deploy --project-ref "$STAGING_REF" --use-api; then
+            explain_cli_failure "Edge function deploy failed" "supabase functions deploy to staging failed."
+            exit 1
+          fi
