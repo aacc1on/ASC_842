@@ -270,3 +270,4 @@ Leases are classified as finance if any of the following are true:
 5. The asset is specialized
 
 If none are met, the lease is classified as operating. The app supports both automatic classification (based on criteria inputs) and manual override.
+# ASC_842
