@@ -212,6 +212,81 @@ describe('PlatformAdminView — block / unblock', () => {
   });
 });
 
+describe('PlatformAdminView — primary admin manages platform admins', () => {
+  const adminUsers = [
+    { ...mockUsers[0], is_platform_admin: true, is_primary_admin: true },
+    { ...mockUsers[1], is_platform_admin: true, is_primary_admin: false },
+    { ...mockUsers[2], is_platform_admin: false, is_primary_admin: false },
+  ];
+
+  function mockRpcAs(primary: boolean) {
+    const builder = { order: () => builder, range: () => Promise.resolve({ data: adminUsers, error: null }) };
+    vi.mocked(supabase.rpc).mockImplementation(((name: string) => {
+      if (name === 'is_primary_platform_admin') return Promise.resolve({ data: primary, error: null });
+      if (name === 'set_platform_admin') return Promise.resolve({ data: null, error: null });
+      return builder;
+    }) as never);
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it('shows Primary / Platform admin badges', async () => {
+    mockRpcAs(false);
+    const { PlatformAdminView } = await import('../components/PlatformAdminView');
+    render(<PlatformAdminView />);
+    await screen.findByText('Alice Admin');
+    expect(screen.getByText('Primary admin')).toBeInTheDocument();
+    expect(screen.getByText('Platform admin')).toBeInTheDocument();
+  });
+
+  it('hides admin management from non-primary platform admins', async () => {
+    mockRpcAs(false);
+    const { PlatformAdminView } = await import('../components/PlatformAdminView');
+    render(<PlatformAdminView />);
+    await screen.findByText('Alice Admin');
+    expect(screen.queryByRole('button', { name: /platform admin/i })).not.toBeInTheDocument();
+  });
+
+  it('lets the primary grant and revoke, but never on the primary row', async () => {
+    mockRpcAs(true);
+    const { PlatformAdminView } = await import('../components/PlatformAdminView');
+    const { waitFor } = await import('@testing-library/react');
+    render(<PlatformAdminView />);
+    await screen.findByText('Alice Admin');
+    await waitFor(() => expect(screen.getAllByRole('button', { name: 'Make platform admin' })).toHaveLength(1));
+    expect(screen.getAllByRole('button', { name: 'Remove platform admin' })).toHaveLength(1);
+  });
+
+  it('calls set_platform_admin after confirmation', async () => {
+    mockRpcAs(true);
+    vi.stubGlobal('confirm', vi.fn(() => true));
+    const { PlatformAdminView } = await import('../components/PlatformAdminView');
+    const { fireEvent, waitFor } = await import('@testing-library/react');
+    render(<PlatformAdminView />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Make platform admin' }));
+    await waitFor(() =>
+      expect(supabase.rpc).toHaveBeenCalledWith('set_platform_admin', { p_user_id: 'u3', p_make_admin: true }),
+    );
+  });
+});
+
+describe('platform admin migration — primary-only management', () => {
+  it('guards set_platform_admin to the primary, protects the primary and logs changes', () => {
+    const file = path.resolve(__dirname, '../../supabase/migrations/20261017120000_platform_admin_block_users.sql');
+    const sql = fs.readFileSync(file, 'utf8');
+    expect(sql).toMatch(/NOT internal\.is_primary_platform_admin\(\)/);
+    expect(sql).toMatch(/primary platform administrator cannot be removed/);
+    expect(sql).toMatch(/p_user_id = auth\.uid\(\)/);
+    expect(sql).toMatch(/INSERT INTO internal\.platform_admin_events/);
+    expect(sql).toMatch(/REVOKE ALL ON FUNCTION public\.set_platform_admin\(uuid, boolean\) FROM PUBLIC, anon;/);
+    expect(sql).toMatch(/platform_admins_single_primary/);
+  });
+});
+
 describe('get_all_users_with_plans RPC — migration exists', () => {
   it('the migration file exists with SECURITY DEFINER', () => {
     const migrationsDir = path.resolve(__dirname, '../../supabase/migrations');

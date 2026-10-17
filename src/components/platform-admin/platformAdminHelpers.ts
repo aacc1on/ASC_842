@@ -15,6 +15,7 @@ export interface PlatformUser {
   created_at: string;
   banned_until?: string | null;
   is_platform_admin?: boolean | null;
+  is_primary_admin?: boolean | null;
   terms_version?: string | null;
   terms_accepted_at?: string | null;
 }

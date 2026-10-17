@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Search, Users, Building2, Mail, Shield, AlertCircle, RefreshCw, Pencil, Trash2, Ban, CheckCircle2 } from 'lucide-react';
+import { Search, Users, Building2, Mail, Shield, AlertCircle, RefreshCw, Pencil, Trash2, Ban, CheckCircle2, Crown, ShieldPlus, ShieldMinus } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import type { UserRole } from '../App';
 import { Pagination } from './Pagination';
@@ -35,6 +35,8 @@ export function PlatformAdminView() {
   const [deleteError, setDeleteError] = useState('');
   const [actionSuccess, setActionSuccess] = useState('');
   const [blockingId, setBlockingId] = useState<string | null>(null);
+  const [isPrimaryAdmin, setIsPrimaryAdmin] = useState(false);
+  const [adminChangeId, setAdminChangeId] = useState<string | null>(null);
   const [billingWarning, setBillingWarning] = useState(false);
 
   const loadUsers = useCallback(async () => {
@@ -57,6 +59,17 @@ export function PlatformAdminView() {
     } finally {
       setLoading(false);
     }
+  }, []);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const { data } = await supabase.rpc('is_primary_platform_admin');
+        setIsPrimaryAdmin(data === true);
+      } catch {
+        setIsPrimaryAdmin(false);
+      }
+    })();
   }, []);
 
   useEffect(() => {
@@ -178,6 +191,32 @@ export function PlatformAdminView() {
       setError(toUserMessage(err, block ? 'Failed to block user.' : 'Failed to unblock user.'));
     } finally {
       setBlockingId(null);
+    }
+  };
+
+  const handleTogglePlatformAdmin = async (user: PlatformUser) => {
+    const makeAdmin = !user.is_platform_admin;
+    const label = user.email || user.full_name || 'this user';
+    const question = makeAdmin
+      ? `Make ${label} a platform admin? They will see and manage every user and organization on the platform.`
+      : `Remove platform admin access from ${label}?`;
+    if (!window.confirm(question)) return;
+
+    setAdminChangeId(user.user_id);
+    setError('');
+    try {
+      const { error: rpcError } = await supabase.rpc('set_platform_admin', {
+        p_user_id: user.user_id,
+        p_make_admin: makeAdmin,
+      });
+      if (rpcError) throw rpcError;
+      setActionSuccess(makeAdmin ? 'Platform admin added.' : 'Platform admin removed.');
+      setTimeout(() => setActionSuccess(''), 3000);
+      await loadUsers();
+    } catch (err) {
+      setError(toUserMessage(err, makeAdmin ? 'Failed to add platform admin.' : 'Failed to remove platform admin.'));
+    } finally {
+      setAdminChangeId(null);
     }
   };
 
@@ -333,6 +372,12 @@ export function PlatformAdminView() {
                             <Mail className="w-3 h-3" />
                             {user.email || '—'}
                           </div>
+                          {user.is_platform_admin && (
+                            <span className="inline-flex items-center gap-1 mt-1 px-2 py-0.5 rounded-full text-xs font-bold border bg-slate-800 text-white border-slate-800">
+                              {user.is_primary_admin ? <Crown className="w-3 h-3" /> : <Shield className="w-3 h-3" />}
+                              {user.is_primary_admin ? 'Primary admin' : 'Platform admin'}
+                            </span>
+                          )}
                         </td>
                         <td className="px-4 py-3">
                           <div className="text-slate-700 font-medium">{user.org_name || '—'}</div>
@@ -386,6 +431,17 @@ export function PlatformAdminView() {
                             >
                               <Pencil className="w-4 h-4" />
                             </button>
+                            {isPrimaryAdmin && !user.is_primary_admin && (
+                              <button
+                                onClick={() => handleTogglePlatformAdmin(user)}
+                                disabled={adminChangeId === user.user_id}
+                                className="p-2 rounded-lg hover:bg-slate-200 text-slate-700 transition disabled:opacity-50"
+                                title={user.is_platform_admin ? 'Remove platform admin' : 'Make platform admin'}
+                                aria-label={user.is_platform_admin ? 'Remove platform admin' : 'Make platform admin'}
+                              >
+                                {user.is_platform_admin ? <ShieldMinus className="w-4 h-4" /> : <ShieldPlus className="w-4 h-4" />}
+                              </button>
+                            )}
                             {!user.is_platform_admin && (
                               <button
                                 onClick={() => handleToggleBlock(user)}
