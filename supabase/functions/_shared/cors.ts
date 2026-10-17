@@ -1,4 +1,4 @@
-const LIVE_ORIGIN = "https://asc-842-lease-accoun-i2cs.bolt.host";
+const LIVE_ORIGIN = "https://asc-842.onrender.com";
 
 // Bolt preview runs on per-session subdomains of webcontainer-api.io.
 function isBoltPreviewOrigin(origin: string): boolean {

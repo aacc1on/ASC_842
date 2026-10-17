@@ -33,7 +33,7 @@ async function openPortal(stripe: Stripe, admin: SupabaseClient, orgId: string, 
 // Operator check unlocked by a single-use database pass: proves Stripe accepts our configuration. Never returns the session URL.
 async function diagnose(req: Request, admin: SupabaseClient, stripe: Stripe, body: Record<string, unknown>) {
   const orgId = typeof body.organization_id === 'string' ? body.organization_id : '';
-  const returnUrl = typeof body.return_url === 'string' ? body.return_url : 'https://asc-842-lease-accoun-i2cs.bolt.host/billing';
+  const returnUrl = typeof body.return_url === 'string' ? body.return_url : 'https://asc-842.onrender.com/billing';
   const origin = safeOrigin(returnUrl);
   const report: Record<string, unknown> = {
     allowed_origins: (Deno.env.get('APP_ORIGINS') ?? '').split(',').map((s) => s.trim()).filter(Boolean),

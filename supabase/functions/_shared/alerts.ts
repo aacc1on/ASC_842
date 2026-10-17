@@ -42,7 +42,7 @@ export interface DeliveryResult {
 export const RESEND_URL = "https://api.resend.com/emails";
 export const ALERT_FROM = "Lease Accountant Alerts <alerts@ms-consult.us>";
 export const DEFAULT_ALERT_EMAIL_TO = "minas@ms-consult.us";
-export const DEFAULT_APP_URL = "https://asc-842-lease-accoun-i2cs.bolt.host";
+export const DEFAULT_APP_URL = "https://asc-842.onrender.com";
 export const EMAIL_THROTTLE_MINUTES = 15;
 const TEST_THROTTLE_MINUTES = 1;
 

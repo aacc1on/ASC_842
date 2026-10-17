@@ -14,7 +14,7 @@ describe('CORS allowed origins', () => {
   beforeEach(() => vi.unstubAllGlobals());
 
   const preview = 'https://abc123.webcontainer-api.io';
-  const live = 'https://asc-842-lease-accoun-i2cs.bolt.host';
+  const live = 'https://asc-842.onrender.com';
 
   it('blocks Bolt preview origins by default (secure by default) but keeps the live site', async () => {
     const cors = await loadCors({});
