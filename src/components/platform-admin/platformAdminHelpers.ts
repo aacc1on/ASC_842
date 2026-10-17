@@ -13,6 +13,8 @@ export interface PlatformUser {
   trial_ends_at: string | null;
   current_period_end: string | null;
   created_at: string;
+  banned_until?: string | null;
+  is_platform_admin?: boolean | null;
   terms_version?: string | null;
   terms_accepted_at?: string | null;
 }
@@ -29,6 +31,13 @@ export interface EditState {
   role: UserRole;
   showPassword: boolean;
   newPassword: string;
+}
+
+/** A user is blocked while their Supabase Auth ban is still in the future. */
+export function isUserBlocked(user: Pick<PlatformUser, 'banned_until'>, now: Date = new Date()): boolean {
+  if (!user.banned_until) return false;
+  const until = new Date(user.banned_until);
+  return !Number.isNaN(until.getTime()) && until.getTime() > now.getTime();
 }
 
 export function formatDate(iso: string | null): string {

@@ -5,6 +5,8 @@ import { checkRateLimit, clientIp, tooManyRequests } from "../_shared/rateLimit.
 
 const ALLOWED_ROLES = ["admin", "manage", "view"];
 const MIN_PASSWORD_LENGTH = 12;
+// Supabase Auth ban length for a "blocked" account (~100 years); "none" lifts the ban.
+const BLOCK_DURATION = "876000h";
 
 Deno.serve(async (req: Request) => {
   const ch = corsHeaders(req);
@@ -61,7 +63,7 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    const { targetUserId, fullName, role, newPassword } = await req.json();
+    const { targetUserId, fullName, role, newPassword, blocked } = await req.json();
 
     if (!targetUserId || typeof targetUserId !== "string") {
       return new Response(
@@ -87,6 +89,49 @@ Deno.serve(async (req: Request) => {
       return new Response(
         JSON.stringify({ error: "User not found.", code: "NOT_FOUND" }),
         { status: 404, headers: { ...ch, "Content-Type": "application/json" } }
+      );
+    }
+
+    if (typeof blocked === "boolean") {
+      if (targetUserId === user.id) {
+        return new Response(
+          JSON.stringify({ error: "You cannot block your own account.", code: "SELF_BLOCK" }),
+          { status: 400, headers: { ...ch, "Content-Type": "application/json" } }
+        );
+      }
+      const { data: targetIsPlatformAdmin, error: targetAdminError } = await supabaseAdmin.rpc(
+        "is_platform_admin_for_user",
+        { target_user_id: targetUserId },
+      );
+      if (targetAdminError) {
+        console.error("Failed to check target platform admin:", targetAdminError);
+        return new Response(
+          JSON.stringify({ error: "Could not verify the target account.", code: "UNEXPECTED" }),
+          { status: 500, headers: { ...ch, "Content-Type": "application/json" } }
+        );
+      }
+      if (blocked && targetIsPlatformAdmin === true) {
+        return new Response(
+          JSON.stringify({ error: "Platform administrators cannot be blocked.", code: "ADMIN_BLOCK" }),
+          { status: 400, headers: { ...ch, "Content-Type": "application/json" } }
+        );
+      }
+
+      const { error: banError } = await supabaseAdmin.auth.admin.updateUserById(
+        targetUserId,
+        { ban_duration: blocked ? BLOCK_DURATION : "none" },
+      );
+      if (banError) {
+        console.error("Failed to update block status:", banError);
+        return new Response(
+          JSON.stringify({ error: "Failed to update block status.", code: "BLOCK_FAILED" }),
+          { status: 500, headers: { ...ch, "Content-Type": "application/json" } }
+        );
+      }
+
+      return new Response(
+        JSON.stringify({ success: true, blocked }),
+        { headers: { ...ch, "Content-Type": "application/json" } }
       );
     }
 

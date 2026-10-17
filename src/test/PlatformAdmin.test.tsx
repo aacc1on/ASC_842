@@ -147,6 +147,71 @@ describe('PlatformAdminView — rendering', () => {
   });
 });
 
+describe('PlatformAdminView — block / unblock', () => {
+  const future = new Date(Date.now() + 86_400_000).toISOString();
+  const past = new Date(Date.now() - 86_400_000).toISOString();
+  const blockUsers = [
+    { ...mockUsers[0], is_platform_admin: true, banned_until: null },
+    { ...mockUsers[1], is_platform_admin: false, banned_until: future },
+    { ...mockUsers[2], is_platform_admin: false, banned_until: past },
+  ];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it('isUserBlocked treats only a future ban as blocked', async () => {
+    const { isUserBlocked } = await import('../components/platform-admin/platformAdminHelpers');
+    expect(isUserBlocked({ banned_until: future })).toBe(true);
+    expect(isUserBlocked({ banned_until: past })).toBe(false);
+    expect(isUserBlocked({ banned_until: null })).toBe(false);
+    expect(isUserBlocked({})).toBe(false);
+  });
+
+  it('shows a Blocked badge, Unblock for banned users and no block action for platform admins', async () => {
+    mockRpc({ data: blockUsers, error: null } as never);
+    const { PlatformAdminView } = await import('../components/PlatformAdminView');
+    render(<PlatformAdminView />);
+
+    await screen.findByText('Alice Admin');
+    expect(screen.getAllByText('Blocked')).toHaveLength(1);
+    expect(screen.getAllByRole('button', { name: 'Unblock user' })).toHaveLength(1);
+    // Platform admin row has no block action; the expired-ban user can be blocked.
+    expect(screen.getAllByRole('button', { name: 'Block user' })).toHaveLength(1);
+  });
+
+  it('sends blocked:true to the edge function after confirmation', async () => {
+    mockRpc({ data: blockUsers, error: null } as never);
+    vi.mocked(supabase.auth.getSession).mockResolvedValue({ data: { session: { access_token: 'tok' } } } as never);
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ success: true }) });
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('confirm', vi.fn(() => true));
+    const { PlatformAdminView } = await import('../components/PlatformAdminView');
+    const { fireEvent, waitFor } = await import('@testing-library/react');
+    render(<PlatformAdminView />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Block user' }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toContain('/functions/v1/platform-admin-edit-user');
+    expect(JSON.parse(init.body)).toEqual({ targetUserId: 'u3', blocked: true });
+  });
+
+  it('does nothing when the confirmation is cancelled', async () => {
+    mockRpc({ data: blockUsers, error: null } as never);
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    vi.stubGlobal('confirm', vi.fn(() => false));
+    const { PlatformAdminView } = await import('../components/PlatformAdminView');
+    const { fireEvent } = await import('@testing-library/react');
+    render(<PlatformAdminView />);
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Unblock user' }));
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
 describe('get_all_users_with_plans RPC — migration exists', () => {
   it('the migration file exists with SECURITY DEFINER', () => {
     const migrationsDir = path.resolve(__dirname, '../../supabase/migrations');

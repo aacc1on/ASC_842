@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { Search, Users, Building2, Mail, Shield, AlertCircle, RefreshCw, Pencil, Trash2 } from 'lucide-react';
+import { Search, Users, Building2, Mail, Shield, AlertCircle, RefreshCw, Pencil, Trash2, Ban, CheckCircle2 } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import type { UserRole } from '../App';
 import { Pagination } from './Pagination';
@@ -11,6 +11,7 @@ import { SESSION_EXPIRED_MESSAGE, UserFacingError, toUserMessage } from '../util
 import {
   filterPlatformUsers,
   formatDate,
+  isUserBlocked,
   planBadgeClass,
   resolvePlanLabel,
   roleBadgeClass,
@@ -33,6 +34,7 @@ export function PlatformAdminView() {
   const [deleteSaving, setDeleteSaving] = useState(false);
   const [deleteError, setDeleteError] = useState('');
   const [actionSuccess, setActionSuccess] = useState('');
+  const [blockingId, setBlockingId] = useState<string | null>(null);
   const [billingWarning, setBillingWarning] = useState(false);
 
   const loadUsers = useCallback(async () => {
@@ -133,6 +135,49 @@ export function PlatformAdminView() {
       setEditError(toUserMessage(err, 'Failed to update user.'));
     } finally {
       setEditSaving(false);
+    }
+  };
+
+  const handleToggleBlock = async (user: PlatformUser) => {
+    const block = !isUserBlocked(user);
+    const label = user.email || user.full_name || 'this user';
+    const question = block
+      ? `Block ${label}? They will be signed out within 15 minutes and cannot sign in until unblocked. No data is deleted.`
+      : `Unblock ${label}? They will be able to sign in again.`;
+    if (!window.confirm(question)) return;
+
+    setBlockingId(user.user_id);
+    setError('');
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session) throw new UserFacingError(SESSION_EXPIRED_MESSAGE, 401);
+
+      const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+      const res = await fetch(`${supabaseUrl}/functions/v1/platform-admin-edit-user`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify({ targetUserId: user.user_id, blocked: block }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw edgeFunctionError(res, data, block ? 'Failed to block user.' : 'Failed to unblock user.', {
+          SELF_BLOCK: 'You cannot block your own account.',
+          ADMIN_BLOCK: 'Platform administrators cannot be blocked.',
+          NOT_FOUND: 'User not found.',
+        });
+      }
+
+      setActionSuccess(block ? 'User blocked.' : 'User unblocked.');
+      setTimeout(() => setActionSuccess(''), 3000);
+      await loadUsers();
+    } catch (err) {
+      setError(toUserMessage(err, block ? 'Failed to block user.' : 'Failed to unblock user.'));
+    } finally {
+      setBlockingId(null);
     }
   };
 
@@ -303,7 +348,13 @@ export function PlatformAdminView() {
                           </span>
                         </td>
                         <td className="px-4 py-3 text-slate-500">
-                          {user.plan_status || '—'}
+                          {isUserBlocked(user) && (
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 mb-1 rounded-full text-xs font-bold border bg-red-50 text-red-700 border-red-200">
+                              <Ban className="w-3 h-3" />
+                              Blocked
+                            </span>
+                          )}
+                          <div>{user.plan_status || '—'}</div>
                           {user.trial_ends_at && (
                             <div className="text-xs text-slate-400">
                               trial ends {formatDate(user.trial_ends_at)}
@@ -335,6 +386,17 @@ export function PlatformAdminView() {
                             >
                               <Pencil className="w-4 h-4" />
                             </button>
+                            {!user.is_platform_admin && (
+                              <button
+                                onClick={() => handleToggleBlock(user)}
+                                disabled={blockingId === user.user_id}
+                                className={`p-2 rounded-lg transition disabled:opacity-50 ${isUserBlocked(user) ? 'hover:bg-emerald-100 text-emerald-700' : 'hover:bg-amber-100 text-amber-700'}`}
+                                title={isUserBlocked(user) ? 'Unblock user' : 'Block user'}
+                                aria-label={isUserBlocked(user) ? 'Unblock user' : 'Block user'}
+                              >
+                                {isUserBlocked(user) ? <CheckCircle2 className="w-4 h-4" /> : <Ban className="w-4 h-4" />}
+                              </button>
+                            )}
                             <button
                               onClick={() => setDeleteTarget(user)}
                               className="p-2 rounded-lg hover:bg-red-100 text-red-600 transition"
