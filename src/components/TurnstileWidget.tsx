@@ -1,5 +1,11 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react';
-import { loadTurnstile, TURNSTILE_SITE_KEY, type TurnstileApi } from '../lib/turnstile';
+import {
+  loadTurnstile,
+  TURNSTILE_DISABLED,
+  TURNSTILE_DISABLED_TOKEN,
+  TURNSTILE_SITE_KEY,
+  type TurnstileApi,
+} from '../lib/turnstile';
 
 export interface TurnstileHandle {
   reset(): void;
@@ -26,6 +32,10 @@ export const TurnstileWidget = forwardRef<TurnstileHandle, TurnstileWidgetProps>
 
   useImperativeHandle(ref, () => ({
     reset() {
+      if (TURNSTILE_DISABLED) {
+        onTokenRef.current(TURNSTILE_DISABLED_TOKEN);
+        return;
+      }
       onTokenRef.current(null);
       const widget = widgetRef.current;
       if (widget) widget.api.reset(widget.id);
@@ -34,6 +44,10 @@ export const TurnstileWidget = forwardRef<TurnstileHandle, TurnstileWidgetProps>
 
   useEffect(() => {
     const tokenSink = onTokenRef;
+    if (TURNSTILE_DISABLED) {
+      tokenSink.current(TURNSTILE_DISABLED_TOKEN);
+      return () => tokenSink.current(null);
+    }
     const widgetHolder = widgetRef;
     let cancelled = false;
     let rendered: { api: TurnstileApi; id: string } | null = null;
@@ -69,6 +83,8 @@ export const TurnstileWidget = forwardRef<TurnstileHandle, TurnstileWidgetProps>
       tokenSink.current(null);
     };
   }, [action]);
+
+  if (TURNSTILE_DISABLED) return null;
 
   return (
     <div className={className} role="group" aria-label="Security check">

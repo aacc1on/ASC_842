@@ -1,7 +1,14 @@
 const SCRIPT_SRC = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
 const DEFAULT_SITE_KEY = '0x4AAAAAAFV6FLkKzgUdhFWq';
 
-export const TURNSTILE_SITE_KEY: string = import.meta.env.VITE_TURNSTILE_SITE_KEY || DEFAULT_SITE_KEY;
+const RAW_SITE_KEY: string | undefined = import.meta.env.VITE_TURNSTILE_SITE_KEY;
+
+// VITE_TURNSTILE_SITE_KEY=off skips the widget (e.g. a host whose Turnstile widget is not set up yet).
+// Only use it while Supabase Auth CAPTCHA protection is OFF; Supabase ignores the placeholder token then.
+export const TURNSTILE_DISABLED: boolean = RAW_SITE_KEY?.trim().toLowerCase() === 'off';
+export const TURNSTILE_DISABLED_TOKEN = 'turnstile-disabled';
+
+export const TURNSTILE_SITE_KEY: string = (!TURNSTILE_DISABLED && RAW_SITE_KEY) || DEFAULT_SITE_KEY;
 
 interface TurnstileRenderOptions {
   sitekey: string;

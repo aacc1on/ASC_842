@@ -47,6 +47,8 @@ VITE_SUPABASE_URL=https://<PROJECT_REF>.supabase.co
 VITE_SUPABASE_ANON_KEY=<anon key>
 VITE_TURNSTILE_SITE_KEY=<turnstile site key>
 ENV
+# VITE_TURNSTILE_SITE_KEY=off hides the widget until the host's Turnstile widget exists.
+# Use it only while Supabase Auth CAPTCHA protection is OFF; switch to the real key before enabling it.
 npm ci
 npm run check        # audit, migrations, typecheck, lint, tests, build (needs Node 20+)
 ```

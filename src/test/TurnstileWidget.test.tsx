@@ -43,6 +43,24 @@ afterEach(() => {
 });
 
 describe('TurnstileWidget', () => {
+  it('skips the widget and emits a placeholder token when VITE_TURNSTILE_SITE_KEY=off', async () => {
+    vi.stubEnv('VITE_TURNSTILE_SITE_KEY', 'off');
+    try {
+      const { TurnstileWidget } = await loadModule();
+      const ref = createRef<TurnstileHandle>();
+      const onToken = vi.fn();
+      const { container } = render(<TurnstileWidget ref={ref} onToken={onToken} />);
+      expect(container).toBeEmptyDOMElement();
+      expect(appended).toHaveLength(0);
+      expect(onToken).toHaveBeenLastCalledWith('turnstile-disabled');
+      onToken.mockClear();
+      act(() => ref.current?.reset());
+      expect(onToken).toHaveBeenLastCalledWith('turnstile-disabled');
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it('loads the Turnstile script only once in explicit-render mode', async () => {
     const { TurnstileWidget } = await loadModule();
     const { api } = fakeApi();
